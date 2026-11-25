@@ -1,13 +1,17 @@
 import { DatabaseSync, type SQLOutputValue } from 'node:sqlite'
 import type {
   AchievementResponse,
+  AnkiSettings,
   ApiKeyResponse,
   FocusSettings,
   SkillResponse,
   XpAwardResponse,
   XpEntryResponse,
 } from '@rlrpg/shared/contracts'
-import { DEFAULT_MAXIMUM_MANUAL_XP } from '@rlrpg/shared/rules'
+import {
+  DEFAULT_MAXIMUM_MANUAL_XP,
+  MAXIMUM_MANUAL_XP,
+} from '@rlrpg/shared/rules'
 import { ProgressionLogic } from './Progression.logic.js'
 
 interface SkillRow {
@@ -37,6 +41,7 @@ interface EntryRow {
   minutes: number | null
   activity: string | null
   notes: string | null
+  streak: number
   source: 'manual' | 'focus' | 'automation'
   origin: string | null
   created_at: string
@@ -118,6 +123,7 @@ export class AppDatabase {
         id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
         skill_id TEXT NOT NULL REFERENCES skills(id) ON DELETE RESTRICT, date TEXT NOT NULL,
         xp INTEGER NOT NULL, minutes INTEGER, activity TEXT, notes TEXT,
+        streak INTEGER NOT NULL DEFAULT 0,
         source TEXT NOT NULL CHECK(source IN ('manual','focus','automation')),
         origin TEXT, created_at TEXT NOT NULL, updated_at TEXT NOT NULL
       );
@@ -138,6 +144,11 @@ export class AppDatabase {
         normal_percent INTEGER NOT NULL DEFAULT 1, natural_one_percent INTEGER NOT NULL DEFAULT 0,
         natural_twenty_percent INTEGER NOT NULL DEFAULT 50,
         maximum_manual_xp INTEGER NOT NULL DEFAULT ${DEFAULT_MAXIMUM_MANUAL_XP}
+      );
+      CREATE TABLE IF NOT EXISTS anki_settings (
+        user_id TEXT PRIMARY KEY REFERENCES users(id) ON DELETE CASCADE,
+        new_card_xp INTEGER NOT NULL DEFAULT 1 CHECK(new_card_xp BETWEEN 0 AND ${MAXIMUM_MANUAL_XP}),
+        review_xp INTEGER NOT NULL DEFAULT 1 CHECK(review_xp BETWEEN 0 AND ${MAXIMUM_MANUAL_XP})
       );
       CREATE TABLE IF NOT EXISTS api_keys (
         id TEXT PRIMARY KEY, user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
@@ -163,12 +174,21 @@ export class AppDatabase {
       );
       CREATE INDEX IF NOT EXISTS idx_achievements_skill ON achievements(skill_id);
     `)
+    this.connection.exec(`
+      INSERT OR IGNORE INTO anki_settings (user_id, new_card_xp, review_xp)
+      SELECT id, 1, 1 FROM users;
+    `)
     const entryColumns = this.connection
       .prepare('PRAGMA table_info(xp_entries)')
       .all() as SqlRow<TableInfoRow>[]
     if (!entryColumns.some((column) => column.name === 'achievement_id')) {
       this.connection.exec(
         'ALTER TABLE xp_entries ADD COLUMN achievement_id TEXT',
+      )
+    }
+    if (!entryColumns.some((column) => column.name === 'streak')) {
+      this.connection.exec(
+        'ALTER TABLE xp_entries ADD COLUMN streak INTEGER NOT NULL DEFAULT 0',
       )
     }
     const skillColumns = this.connection
@@ -231,6 +251,26 @@ export class AppDatabase {
     `,
       )
       .all(userId) as SqlRow<LinkRow>[]
+    const user = this.connection
+      .prepare('SELECT timezone FROM users WHERE id = ?')
+      .get(userId) as { timezone: string }
+    const markedDays = this.connection
+      .prepare(
+        'SELECT skill_id, date FROM xp_entries WHERE user_id = ? AND streak = 1 ORDER BY date DESC',
+      )
+      .all(userId) as SqlRow<{ skill_id: string; date: string }>[]
+    const datesBySkill = new Map<string, Set<string>>()
+    for (const day of markedDays) {
+      const dates = datesBySkill.get(day.skill_id) ?? new Set<string>()
+      dates.add(day.date)
+      datesBySkill.set(day.skill_id, dates)
+    }
+    const today = new Intl.DateTimeFormat('en-CA', {
+      timeZone: user.timezone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+    }).format(new Date())
 
     return rows.map((row) => {
       const progression = ProgressionLogic.fromTotalXp(row.total_xp)
@@ -243,6 +283,7 @@ export class AppDatabase {
         headerColor: row.header_color,
         archived: row.archived_at !== null,
         totalXp: row.total_xp,
+        streakCount: this.currentStreak(datesBySkill.get(row.id), today),
         ...progression,
         links: links
           .filter((link) => link.source_skill_id === row.id)
@@ -297,6 +338,7 @@ export class AppDatabase {
       minutes: entry.minutes,
       activity: entry.activity,
       notes: entry.notes,
+      streak: entry.streak === 1,
       source: entry.achievement_id === null ? entry.source : 'achievement',
       origin: entry.origin,
       createdAt: entry.created_at,
@@ -313,6 +355,25 @@ export class AppDatabase {
         .filter((roll) => roll.entry_id === entry.id)
         .map((roll) => roll.roll),
     }))
+  }
+
+  private currentStreak(dates: Set<string> | undefined, today: string): number {
+    if (dates === undefined || dates.size === 0) return 0
+    const yesterdayDate = new Date(`${today}T00:00:00.000Z`)
+    yesterdayDate.setUTCDate(yesterdayDate.getUTCDate() - 1)
+    let currentDate = dates.has(today)
+      ? today
+      : yesterdayDate.toISOString().slice(0, 10)
+    if (!dates.has(currentDate)) return 0
+
+    let streakCount = 0
+    while (dates.has(currentDate)) {
+      streakCount += 1
+      const previousDate = new Date(`${currentDate}T00:00:00.000Z`)
+      previousDate.setUTCDate(previousDate.getUTCDate() - 1)
+      currentDate = previousDate.toISOString().slice(0, 10)
+    }
+    return streakCount
   }
 
   listAchievements(userId: string, skillId?: string): AchievementResponse[] {
@@ -353,6 +414,21 @@ export class AppDatabase {
     }
   }
 
+  getAnkiSettings(userId: string): AnkiSettings {
+    const row = this.connection
+      .prepare('SELECT new_card_xp, review_xp FROM anki_settings WHERE user_id = ?')
+      .get(userId) as { new_card_xp: number; review_xp: number }
+    return { newCardXp: row.new_card_xp, reviewXp: row.review_xp }
+  }
+
+  updateAnkiSettings(userId: string, settings: AnkiSettings): void {
+    this.connection
+      .prepare(
+        'UPDATE anki_settings SET new_card_xp = ?, review_xp = ? WHERE user_id = ?',
+      )
+      .run(settings.newCardXp, settings.reviewXp, userId)
+  }
+
   listApiKeys(userId: string): ApiKeyResponse[] {
     return this.connection
       .prepare(
@@ -364,3 +440,4 @@ export class AppDatabase {
       .all(userId) as SqlRow<ApiKeyResponse>[]
   }
 }
+

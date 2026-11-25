@@ -52,10 +52,11 @@ export const manualEntrySchema = z.object({
   minutes: z.number().int().positive().max(100_000).nullable().optional(),
   activity: z.string().trim().max(120).nullable().optional(),
   notes: z.string().trim().max(4000).nullable().optional(),
+  streak: z.boolean().optional(),
 })
 
 export const automationEntrySchema = manualEntrySchema
-  .omit({ skillId: true, date: true })
+  .omit({ skillId: true, date: true, streak: true })
   .extend({
     skillId: z.string().uuid().optional(),
     skillCode: skillCodeSchema.optional(),
@@ -75,6 +76,11 @@ export const focusSettingsSchema = z.object({
   naturalOneBonusPercent: z.number().int().min(0).max(500),
   naturalTwentyBonusPercent: z.number().int().min(0).max(500),
   maximumManualXp: z.number().int().min(1).max(MAXIMUM_MANUAL_XP),
+})
+
+export const ankiSettingsSchema = z.object({
+  newCardXp: z.number().int().min(0).max(MAXIMUM_MANUAL_XP),
+  reviewXp: z.number().int().min(0).max(MAXIMUM_MANUAL_XP),
 })
 
 export const focusSessionSchema = z.object({
@@ -117,6 +123,7 @@ export interface SkillResponse {
   level: number
   levelXp: number
   nextLevelXp: number
+  streakCount?: number
   links: SkillLinkResponse[]
 }
 
@@ -137,6 +144,7 @@ export interface XpEntryResponse {
   minutes: number | null
   activity: string | null
   notes: string | null
+  streak?: boolean
   source: 'manual' | 'focus' | 'automation' | 'achievement'
   origin: string | null
   createdAt: string
@@ -145,6 +153,7 @@ export interface XpEntryResponse {
 }
 
 export type FocusSettings = z.infer<typeof focusSettingsSchema>
+export type AnkiSettings = z.infer<typeof ankiSettingsSchema>
 
 export interface ApiKeyResponse {
   id: string
@@ -162,7 +171,7 @@ export const achievementInputSchema = z.object({
     .string()
     .trim()
     .max(200000)
-    .default('🏆')
+    .default('ðŸ†')
     .refine(
       (value) =>
         value.length <= 16 ||
@@ -201,3 +210,4 @@ export const historyQuerySchema = z
   .refine((value) => !value.from || !value.to || value.from <= value.to, {
     message: 'from must precede to',
   })
+
